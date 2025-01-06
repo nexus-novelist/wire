@@ -1,8 +1,7 @@
 import { useTheme } from '@nextui-org/use-theme'
+import { Card, CardHeader, CardBody, Divider } from '@nextui-org/react'
 
 import Wire from './pages/wire'
-
-import { Card, CardHeader, CardBody, Divider } from '@nextui-org/react'
 
 function App() {
   const { theme } = useTheme()
@@ -13,7 +12,7 @@ function App() {
     >
       <Card className="w-[90%]">
         <CardHeader>
-          <h1 className="text-2xl font-bold">Wire</h1>
+          <h1 className="text-7xl font-bold italic text-center w-full select-none">Wire</h1>
         </CardHeader>
         <Divider />
         <CardBody>
