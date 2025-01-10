@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import {
   Button,
   Autocomplete,
@@ -6,7 +6,8 @@ import {
   Spacer,
   Input,
   Tooltip,
-  Divider
+  Divider,
+  Kbd
 } from '@nextui-org/react'
 
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome'
@@ -22,15 +23,14 @@ import {
 
 const Wire = () => {
   const [sources, setSources] = useState([])
-  const [recording, setRecording] = useState(false)
   const [selectedSource, setSelectedSource] = useState(null)
   const [clipDuration, setClipDuration] = useState(10)
   const [recordingTime, setRecordingTime] = useState(0)
   const mediaRecorderRef = useRef(null)
   const chunksRef = useRef([])
   const timerIntervalRef = useRef(null)
-  const startTimeRef = useRef(null)
-  const recordingBufferRef = useRef([]) // Rolling buffer for the last N seconds
+  const isRecordingRef = useRef(false)
+  const [isSaving, setIsSaving] = useState(false)
 
   const formatTime = (seconds) => {
     const hours = Math.floor(seconds / 3600)
@@ -40,170 +40,177 @@ const Wire = () => {
   }
 
   const startRecording = async () => {
-    if (!selectedSource) {
-      console.error('No source selected')
-      return
-    }
-
     try {
-      console.log('Starting recording with source:', selectedSource)
+      console.log('Starting recording...')
       const { constraints } = await window.api.startRecording(selectedSource.id)
       console.log('Got constraints:', constraints)
 
-      try {
-        const devices = await navigator.mediaDevices.enumerateDevices()
-        console.log('Available devices:', devices)
+      const stream = await navigator.mediaDevices.getUserMedia(constraints)
+      console.log('Got media stream')
 
-        const stream = await navigator.mediaDevices.getUserMedia(constraints)
-        const audioStream = new MediaStream()
-        const audioTracks = stream.getAudioTracks()
+      const audioStream = new MediaStream()
+      const audioTracks = stream.getAudioTracks()
 
-        if (audioTracks.length === 0) {
-          throw new Error('No audio tracks found in the stream')
-        }
-
-        audioTracks.forEach((track) => audioStream.addTrack(track))
-
-        const mediaRecorder = new MediaRecorder(audioStream, {
-          mimeType: 'audio/webm;codecs=opus'
-        })
-
-        console.log('Created MediaRecorder')
-        chunksRef.current = []
-        recordingBufferRef.current = []
-        setRecordingTime(0)
-        startTimeRef.current = Date.now()
-
-        timerIntervalRef.current = setInterval(() => {
-          setRecordingTime((prev) => prev + 1)
-        }, 1000)
-
-        let isFirstChunk = true
-        mediaRecorder.ondataavailable = (e) => {
-          if (e.data && e.data.size > 0) {
-            console.log(
-              'Received chunk of size:',
-              e.data.size,
-              isFirstChunk ? '(header chunk)' : ''
-            )
-
-            // Store the chunk
-            chunksRef.current.push(e.data)
-
-            // For the rolling buffer, don't include the header chunk
-            if (!isFirstChunk) {
-              recordingBufferRef.current.push({
-                data: e.data,
-                timestamp: Date.now()
-              })
-
-              // Keep only the chunks we need for clipping
-              const maxBufferDuration = Math.max(30, clipDuration) * 1000
-              const cutoffTime = Date.now() - maxBufferDuration
-              recordingBufferRef.current = recordingBufferRef.current.filter(
-                (chunk) => chunk.timestamp > cutoffTime
-              )
-            }
-            isFirstChunk = false
-          }
-        }
-
-        mediaRecorder.onerror = (error) => {
-          console.error('MediaRecorder error:', error)
-          setRecording(false)
-          stream.getTracks().forEach((track) => track.stop())
-          if (timerIntervalRef.current) {
-            clearInterval(timerIntervalRef.current)
-          }
-        }
-
-        mediaRecorder.onstop = async () => {
-          if (timerIntervalRef.current) {
-            clearInterval(timerIntervalRef.current)
-          }
-
-          if (chunksRef.current.length === 0) {
-            console.error('No chunks recorded')
-            return
-          }
-
-          const blob = new Blob(chunksRef.current, {
-            type: 'audio/webm;codecs=opus'
-          })
-          console.log(`Saving full recording, size: ${blob.size} bytes`)
-          const arrayBuffer = await blob.arrayBuffer()
-          await window.api.saveAudioFile(arrayBuffer)
-          stream.getTracks().forEach((track) => track.stop())
-        }
-
-        // Start recording with 500ms timeslices
-        mediaRecorder.start(500)
-        mediaRecorderRef.current = mediaRecorder
-        setRecording(true)
-      } catch (error) {
-        console.error('Error getting media stream:', error)
-        if (error.name === 'NotAllowedError') {
-          console.error('Permission denied to access media devices')
-        } else if (error.name === 'NotFoundError') {
-          console.error('No audio device found')
-        }
-        throw error
+      if (audioTracks.length === 0) {
+        throw new Error('No audio tracks found in the stream')
       }
-    } catch (error) {
-      console.error('Error starting recording:', error)
-    }
-  }
 
-  const stopRecording = () => {
-    if (mediaRecorderRef.current && recording) {
-      mediaRecorderRef.current.stop()
-      setRecording(false)
+      audioTracks.forEach((track) => audioStream.addTrack(track))
+
+      const mediaRecorder = new MediaRecorder(audioStream, {
+        mimeType: 'audio/webm;codecs=opus',
+        bitsPerSecond: 128000
+      })
+
+      console.log('Created MediaRecorder')
+      mediaRecorderRef.current = mediaRecorder
+      chunksRef.current = []
+
+      mediaRecorder.ondataavailable = (event) => {
+        console.log('Data available:', event.data.size, 'bytes')
+        if (event.data.size > 0) {
+          chunksRef.current.push(event.data)
+        }
+      }
+
+      mediaRecorder.start(100) // Collect data more frequently
+      isRecordingRef.current = true
+      setRecordingTime(0)
+
+      // Start the timer
       if (timerIntervalRef.current) {
         clearInterval(timerIntervalRef.current)
       }
+      timerIntervalRef.current = setInterval(() => {
+        setRecordingTime((prev) => prev + 1)
+      }, 1000)
+
+      console.log('Recording started')
+    } catch (error) {
+      console.error('Error in startRecording:', error)
     }
   }
 
-  const clip = async () => {
-    if (!recording || recordingBufferRef.current.length === 0) {
+  const stopRecording = async () => {
+    console.log('Stopping recording...')
+    try {
+      if (!mediaRecorderRef.current) {
+        console.error('No media recorder found')
+        return
+      }
+
+      // Clear the timer
+      if (timerIntervalRef.current) {
+        clearInterval(timerIntervalRef.current)
+        timerIntervalRef.current = null
+      }
+
+      const recorder = mediaRecorderRef.current
+
+      // Create a promise that resolves when we get the last chunk of data
+      const dataPromise = new Promise((resolve) => {
+        const handleData = async (event) => {
+          console.log('Final data available:', event.data.size, 'bytes')
+          if (event.data.size > 0) {
+            chunksRef.current.push(event.data)
+          }
+          resolve()
+        }
+        recorder.addEventListener('dataavailable', handleData, { once: true })
+      })
+
+      // Stop the recording
+      console.log('Stopping MediaRecorder...')
+      recorder.stop()
+      isRecordingRef.current = false
+
+      // Wait for the last chunk of data
+      console.log('Waiting for final data...')
+      await dataPromise
+
+      if (chunksRef.current.length > 0) {
+        console.log('Processing', chunksRef.current.length, 'chunks')
+        const blob = new Blob(chunksRef.current, { type: 'audio/webm;codecs=opus' })
+        console.log('Created blob:', blob.size, 'bytes')
+        const arrayBuffer = await blob.arrayBuffer()
+        console.log('Converted to array buffer:', arrayBuffer.byteLength, 'bytes')
+
+        try {
+          setIsSaving(true)
+          const success = await window.api.convertAndSaveAudio(arrayBuffer)
+          if (success) {
+            console.log('Audio saved successfully as MP3')
+          } else {
+            console.error('Failed to save audio')
+          }
+        } catch (error) {
+          console.error('Error converting audio:', error)
+        } finally {
+          setIsSaving(false)
+        }
+      }
+
+      // Clear the audio chunks and reset state
+      chunksRef.current = []
+      mediaRecorderRef.current = null
+      console.log('Recording cleanup completed')
+    } catch (error) {
+      console.error('Error in stopRecording:', error)
+    }
+  }
+
+  const clip = useCallback(async () => {
+    if (!isRecordingRef.current || chunksRef.current.length === 0) {
       console.log('No recording data available')
       return
     }
 
     try {
-      // Always include the first chunk (contains WebM header) and recent chunks
+      console.log('Creating clip of last', clipDuration, 'seconds')
+
+      // Calculate how many chunks we need based on the chunk interval (100ms)
+      const chunksNeeded = Math.ceil((clipDuration * 1000) / 100)
+
+      // Always include the first chunk (contains WebM header)
       const firstChunk = chunksRef.current[0]
-      const cutoffTime = Date.now() - clipDuration * 1000
-      const recentChunks = recordingBufferRef.current
-        .filter((chunk) => chunk.timestamp >= cutoffTime)
-        .map((chunk) => chunk.data)
+
+      // Get the recent chunks, but exclude the first chunk if it's in the range
+      const recentChunks = chunksRef.current.slice(-chunksNeeded)
+      if (recentChunks[0] === firstChunk && recentChunks.length > 1) {
+        recentChunks.shift()
+      }
 
       if (recentChunks.length === 0) {
-        console.log(`No audio data in the last ${clipDuration} seconds`)
+        console.log('No recent chunks available')
         return
       }
 
-      console.log(`Creating clip from ${recentChunks.length} chunks (plus header)`)
+      const chunks = [firstChunk, ...recentChunks]
+      console.log(`Using ${chunks.length} chunks for the clip (including header)`)
 
-      // Create a new blob with the header chunk first, then the recent chunks
-      const blob = new Blob([firstChunk, ...recentChunks], {
-        type: 'audio/webm;codecs=opus'
-      })
+      const blob = new Blob(chunks, { type: 'audio/webm;codecs=opus' })
+      console.log('Created clip blob:', blob.size, 'bytes')
 
-      console.log(`Clip blob size: ${blob.size} bytes`)
       const arrayBuffer = await blob.arrayBuffer()
-      console.log(`ArrayBuffer size: ${arrayBuffer.byteLength} bytes`)
+      console.log('Converting clip to MP3...')
 
-      const success = await window.api.saveAudioFile(arrayBuffer)
-      if (success) {
-        console.log('Clip saved successfully')
-      } else {
-        console.error('Failed to save clip')
+      try {
+        setIsSaving(true)
+        const success = await window.api.convertAndSaveAudio(arrayBuffer)
+        if (success) {
+          console.log('Clip saved successfully')
+        } else {
+          console.error('Failed to save clip')
+        }
+      } catch (error) {
+        console.error('Error saving clip:', error)
+      } finally {
+        setIsSaving(false)
       }
     } catch (error) {
       console.error('Error creating clip:', error)
     }
-  }
+  }, [isRecordingRef, clipDuration])
 
   const getSources = async () => {
     try {
@@ -218,16 +225,29 @@ const Wire = () => {
 
   useEffect(() => {
     getSources()
+
+    // Set up clip shortcut listener
+    const cleanup = window.api.onTriggerClip(() => {
+      console.log('Shortcut triggered in renderer, recording state:', isRecordingRef.current)
+      if (isRecordingRef.current) {
+        console.log('Recording active, calling clip function')
+        clip()
+      } else {
+        console.log('Not recording, ignoring shortcut')
+      }
+    })
+
     return () => {
       // Cleanup on unmount
-      if (mediaRecorderRef.current && recording) {
+      if (mediaRecorderRef.current && isRecordingRef.current) {
         stopRecording()
       }
       if (timerIntervalRef.current) {
         clearInterval(timerIntervalRef.current)
       }
+      cleanup()
     }
-  }, [])
+  }, [isRecordingRef, clip])
 
   return (
     <div className="p-4 space-y-4">
@@ -264,34 +284,42 @@ const Wire = () => {
           onChange={(e) => setClipDuration(e.target.value)}
           className="w-1/2"
         ></Input>
-        <Button
-          startContent={<FontAwesomeIcon icon={faScissors} />}
-          size="lg"
-          onPress={clip}
-          color="primary"
-          className="flex-1"
-        >
-          Clip last {clipDuration} seconds
-        </Button>
+        <Tooltip content="Control + Shift + F6" showArrow color="primary">
+          <Button
+            startContent={<FontAwesomeIcon icon={faScissors} />}
+            size="lg"
+            onPress={clip}
+            color="primary"
+            className="flex-1"
+            endContent={<Kbd keys={['ctrl', 'shift']}>F6</Kbd>}
+          >
+            Clip last {clipDuration} seconds
+          </Button>
+        </Tooltip>
       </div>
       <Spacer y={5} />
       <div className="flex justify-center">
         <Button
-          onPress={recording ? stopRecording : startRecording}
-          color={recording ? 'danger' : 'primary'}
-          startContent={<FontAwesomeIcon icon={recording ? faStop : faPlay} />}
+          onPress={isRecordingRef.current ? stopRecording : startRecording}
+          color={isRecordingRef.current ? 'danger' : 'primary'}
+          startContent={<FontAwesomeIcon icon={isRecordingRef.current ? faStop : faPlay} />}
           size="lg"
           radius="full"
+          isLoading={isSaving}
         >
-          {recording ? 'Stop Recording' : 'Start Recording'}
+          {isRecordingRef.current ? 'Stop Recording' : 'Start Recording'}
         </Button>
       </div>
       <Divider />
       <Input
         startContent={
-          recording ? <FontAwesomeIcon icon={faVideo} /> : <FontAwesomeIcon icon={faCircle} />
+          isRecordingRef.current ? (
+            <FontAwesomeIcon icon={faVideo} />
+          ) : (
+            <FontAwesomeIcon icon={faCircle} />
+          )
         }
-        value={recording ? 'Recording' : 'Ready to record'}
+        value={isRecordingRef.current ? 'Recording' : 'Ready to record'}
         endContent={formatTime(recordingTime)}
         isReadOnly
         className="text-center"

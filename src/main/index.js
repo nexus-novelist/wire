@@ -1,8 +1,17 @@
-import { app, shell, BrowserWindow, ipcMain, desktopCapturer, dialog } from 'electron'
+import {
+  app,
+  shell,
+  BrowserWindow,
+  ipcMain,
+  desktopCapturer,
+  dialog,
+  globalShortcut
+} from 'electron'
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
-import { writeFile } from 'fs/promises'
+import { writeFile, unlink } from 'fs/promises'
+import ffmpeg from 'fluent-ffmpeg'
 
 function createWindow() {
   // Create the browser window.
@@ -67,6 +76,22 @@ app.whenReady().then(() => {
   app.on('browser-window-created', (_, window) => {
     optimizer.watchWindowShortcuts(window)
   })
+
+  // Register global shortcut
+  const ret = globalShortcut.register('Control+Shift+F6', () => {
+    console.log('Ctrl+Shift+F6 pressed')
+    const mainWindow = BrowserWindow.getAllWindows()[0]
+    if (mainWindow) {
+      mainWindow.webContents.send('trigger-clip')
+    }
+  })
+
+  if (!ret) {
+    console.log('Failed to register Ctrl+Shift+F6')
+  }
+
+  // Check if shortcut is registered
+  console.log('Ctrl+Shift+F6 is registered:', globalShortcut.isRegistered('Control+Shift+F6'))
 
   createWindow()
 
@@ -175,4 +200,83 @@ ipcMain.handle('SAVE_AUDIO_FILE', async (event, buffer) => {
     console.error('Error saving file:', error)
     throw error // Propagate error to renderer
   }
+})
+
+ipcMain.handle('convertAndSaveAudio', async (event, audioBuffer) => {
+  console.log('Starting audio conversion...')
+  try {
+    if (!audioBuffer || audioBuffer.byteLength === 0) {
+      console.error('Invalid audio buffer received')
+      return false
+    }
+
+    // Show save dialog
+    const { canceled, filePath } = await dialog.showSaveDialog({
+      title: 'Save Recording',
+      defaultPath: join(
+        app.getPath('downloads'),
+        `wire-${new Date().toISOString().replace(/[:.]/g, '-')}.mp3`
+      ),
+      filters: [{ name: 'MP3 Files', extensions: ['mp3'] }]
+    })
+
+    if (canceled || !filePath) {
+      console.log('Save dialog cancelled')
+      return false
+    }
+
+    console.log('Received audio buffer size:', audioBuffer.byteLength, 'bytes')
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
+    const tempWebmPath = join(app.getPath('temp'), `temp-${timestamp}.webm`)
+
+    // Save the WebM file temporarily
+    console.log('Saving temporary WebM file:', tempWebmPath)
+    await writeFile(tempWebmPath, Buffer.from(audioBuffer))
+    console.log('Temporary file saved')
+
+    // Convert to MP3 using ffmpeg
+    console.log('Starting ffmpeg conversion...')
+    return new Promise((resolve) => {
+      ffmpeg()
+        .input(tempWebmPath)
+        .inputOptions(['-f webm'])
+        .outputOptions(['-acodec libmp3lame', '-ab 128k', '-ar 44100', '-ac 2'])
+        .on('start', (commandLine) => {
+          console.log('FFmpeg command:', commandLine)
+        })
+        .on('stderr', (line) => {
+          console.log('FFmpeg stderr:', line)
+        })
+        .on('progress', (progress) => {
+          console.log('Processing:', progress.percent, '% done')
+        })
+        .on('end', async () => {
+          console.log('FFmpeg conversion completed')
+          try {
+            await unlink(tempWebmPath)
+            console.log('Temporary file cleaned up')
+            resolve(true)
+          } catch (cleanupError) {
+            console.error('Error cleaning up temporary file:', cleanupError)
+            resolve(true)
+          }
+        })
+        .on('error', (err, stdout, stderr) => {
+          console.error('FFmpeg conversion error:', err)
+          console.error('FFmpeg stdout:', stdout)
+          console.error('FFmpeg stderr:', stderr)
+          resolve(false)
+        })
+        .save(filePath)
+    })
+  } catch (error) {
+    console.error('Error in convertAndSaveAudio:', error)
+    return false
+  }
+})
+
+// Unregister all shortcuts when app quits
+app.on('will-quit', () => {
+  console.log('Unregistering all shortcuts')
+  globalShortcut.unregisterAll()
 })

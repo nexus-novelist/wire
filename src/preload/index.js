@@ -11,6 +11,13 @@ const api = {
   },
   saveAudioFile: async (buffer) => {
     return await ipcRenderer.invoke('SAVE_AUDIO_FILE', buffer)
+  },
+  convertAndSaveAudio: (buffer) => ipcRenderer.invoke('convertAndSaveAudio', buffer),
+  onTriggerClip: (callback) => {
+    ipcRenderer.on('trigger-clip', callback)
+    return () => {
+      ipcRenderer.removeListener('trigger-clip', callback)
+    }
   }
 }
 
